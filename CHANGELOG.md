@@ -1,5 +1,13 @@
 # Changelog
 
+## [Unreleased — mixtrio]
+
+Fork MIXTRIO de `tobi/qmd`, branche `mixtrio` posée sur `v2.8.3`. Chantier
+`vscode_dev_tools/analyse/SPEC-QMD-FORK-REMOTE-2026-001.md`. Convention : cette section porte
+uniquement ce que la branche ajoute par rapport au tag amont ; elle est rejouée à chaque rebase.
+
+- Version `2.8.3-mixtrio.0` — socle, aucun changement fonctionnel.
+
 ## [Unreleased]
 
 ## [2.8.3] - 2026-08-16
