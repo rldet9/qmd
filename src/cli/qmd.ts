@@ -86,7 +86,8 @@ import {
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
+import { looksLikeRemoteModelUri, parseRemoteModelUri } from "../remote-llm.js";
+import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, createLLM, HybridLLM, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -159,7 +160,8 @@ function getStore(): ReturnType<typeof createStore> {
       // Untrusted project-local custom model URIs must not be loaded; status
       // still displays the YAML values via resolveModelsForCli (#889).
       const modelsForLlm = localConfigIsFullyTrusted() ? activeModels : resolveModels();
-      const llm = new LlamaCpp({
+      // Fork MIXTRIO : HybridLLM quand models.embed est une URI distante.
+      const llm = createLLM({
         embedModel: modelsForLlm.embed,
         generateModel: modelsForLlm.generate,
         rerankModel: modelsForLlm.rerank,
@@ -3684,6 +3686,10 @@ function formatCount(n: number): string {
 }
 
 function shortModelName(model: string): string {
+  const remote = parseRemoteModelUri(model);
+  if (remote) {
+    return `${remote.model} @ ${remote.baseUrl} (${remote.scheme})`;
+  }
   if (model.startsWith("hf:")) {
     return model.split("/").pop() || model;
   }
@@ -3900,6 +3906,11 @@ function checkModelCache(activeModels: { embed: string; generate: string; rerank
   const invalid: string[] = [];
   for (const [model, roles] of unique) {
     const label = `${roles.join("+")}: ${model}`;
+    if (looksLikeRemoteModelUri(model)) {
+      // Fork MIXTRIO : rien en cache pour un modèle distant ; l'endpoint est sondé par le device probe.
+      cached.push(`${label} (distant)`);
+      continue;
+    }
     const inspection = findCachedModelInspection(model);
     invalid.push(...inspection.invalid.map(detail => `${label} (${detail})`));
     if (inspection.path) {
@@ -4071,7 +4082,30 @@ async function runDoctorDeviceChecks(nextSteps: string[]): Promise<void> {
   }
 
   try {
-    const device = await getDefaultLlamaCpp().getDeviceInfo({ allowBuild: false });
+    const activeLlm = getDefaultLlamaCpp();
+    if (activeLlm instanceof HybridLLM || !activeLlm.getDeviceInfo) {
+      // Fork MIXTRIO : pas de périphérique local à sonder, on sonde l'endpoint distant.
+      if (process.stdout.isTTY) {
+        process.stdout.write(`\r${" ".repeat(crashHint.length)}\r`);
+      }
+      const remote = activeLlm instanceof HybridLLM ? activeLlm.remote : null;
+      if (!remote) {
+        doctorCheck("device probe", true, "backend sans périphérique local");
+        return;
+      }
+      const description = remote.describe();
+      try {
+        const probe = await remote.client.probe();
+        doctorCheck("remote embedding endpoint", true,
+          `${description.endpoint} (${description.model}) -> ${probe.dimensions} dims en ${probe.latencyMs} ms; clé ${description.hasApiKey ? "présente" : "absente"}`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        doctorCheck("remote embedding endpoint", false, `${description.endpoint} (${description.model}) : ${message}`);
+        nextSteps.push("Vérifier l'URL, le nom du modèle et QMD_EMBED_API_KEY / QMD_API_KEY, puis relancer `qmd doctor`.");
+      }
+      return;
+    }
+    const device = await activeLlm.getDeviceInfo({ allowBuild: false });
     if (process.stdout.isTTY) {
       process.stdout.write(`\r${" ".repeat(crashHint.length)}\r`);
     }

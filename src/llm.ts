@@ -10,6 +10,7 @@ import type {
   LlamaEmbeddingContext,
   Token as LlamaToken,
 } from "node-llama-cpp";
+import { RemoteLLM, looksLikeRemoteModelUri, parseRemoteModelUri, describeRemoteUriShape } from "./remote-llm.js";
 
 type StdoutChunk = string | Uint8Array;
 type WriteCallback = (err?: Error | null) => void;
@@ -503,6 +504,12 @@ export async function pullModels(
 
   const results: PullResult[] = [];
   for (const model of models) {
+    // Fork MIXTRIO : un modèle distant n'a rien à télécharger.
+    if (looksLikeRemoteModelUri(model)) {
+      const ref = parseRemoteModelUri(model);
+      results.push({ model, path: ref ? `${ref.scheme} ${ref.baseUrl} (distant, rien à télécharger)` : "(URI distante invalide)", sizeBytes: 0, refreshed: false });
+      continue;
+    }
     let refreshed = false;
     const hfRef = parseHfUri(model);
     const filename = model.split("/").pop();
@@ -591,6 +598,33 @@ export interface LLM {
    * Dispose of resources
    */
   dispose(): Promise<void>;
+}
+
+/**
+ * Ce que le reste de QMD (store.ts, cli, mcp) consomme réellement d'un backend —
+ * fork MIXTRIO, SPEC-QMD-FORK-REMOTE-2026-001 lot 1. `LlamaCpp` l'implémente en
+ * entier ; un backend distant n'a ni tokenizer ni périphérique, d'où les
+ * membres optionnels : le découpage retombe sur les caractères quand
+ * `tokenize` est absent (D-8).
+ */
+export interface QmdLLM extends LLM {
+  readonly embedModelName: string;
+  readonly generateModelName: string;
+  readonly rerankModelName: string;
+  /** Vrai quand l'embedding est servi par HTTP et non par node-llama-cpp. */
+  readonly isRemote: boolean;
+  embedBatch(texts: string[], options?: EmbedOptions): Promise<(EmbeddingResult | null)[]>;
+  tokenize?(text: string): Promise<readonly LlamaToken[]>;
+  detokenize?(tokens: readonly LlamaToken[]): Promise<string>;
+  countTokens?(text: string): Promise<number>;
+  unloadIdleResources?(): Promise<void>;
+  getDeviceInfo?(options?: { allowBuild?: boolean }): Promise<{
+    gpu: string | false;
+    gpuOffloading: boolean;
+    gpuDevices: string[];
+    vram?: { total: number; used: number; free: number };
+    cpuCores: number;
+  }>;
 }
 
 // =============================================================================
@@ -800,7 +834,8 @@ function isCpuModeRequested(): boolean {
   return resolveLlamaGpuMode() === false;
 }
 
-export class LlamaCpp implements LLM {
+export class LlamaCpp implements QmdLLM {
+  readonly isRemote = false;
   private readonly _ciMode = !!process.env.CI;
   private llama: Llama | null = null;
   private embedModel: LlamaModel | null = null;
@@ -1898,11 +1933,11 @@ export class LlamaCpp implements LLM {
  * Coordinates with LlamaCpp idle timeout to prevent disposal during active sessions.
  */
 class LLMSessionManager {
-  private llm: LlamaCpp;
+  private llm: QmdLLM;
   private _activeSessionCount = 0;
   private _inFlightOperations = 0;
 
-  constructor(llm: LlamaCpp) {
+  constructor(llm: QmdLLM) {
     this.llm = llm;
   }
 
@@ -1938,7 +1973,7 @@ class LLMSessionManager {
     this._inFlightOperations = Math.max(0, this._inFlightOperations - 1);
   }
 
-  getLlamaCpp(): LlamaCpp {
+  getLlamaCpp(): QmdLLM {
     return this.llm;
   }
 }
@@ -2111,7 +2146,7 @@ export async function withLLMSession<T>(
  * Unlike withLLMSession, this does not use the global singleton.
  */
 export async function withLLMSessionForLlm<T>(
-  llm: LlamaCpp,
+  llm: QmdLLM,
   fn: (session: ILLMSession) => Promise<T>,
   options?: LLMSessionOptions
 ): Promise<T> {
@@ -2198,16 +2233,119 @@ export function isDarwinExitGuardInstalled(): boolean {
 // Singleton for default LlamaCpp instance
 // =============================================================================
 
-let defaultLlamaCpp: LlamaCpp | null = null;
+// =============================================================================
+// Fork MIXTRIO — sélection du backend et backend hybride
+// =============================================================================
 
 /**
- * Get the default LlamaCpp instance (creates one if needed). The LlamaCpp
- * constructor installs the darwin exit guard, so any code path that obtains
- * the singleton is protected.
+ * Embedding distant (`RemoteLLM`), tout le reste sur node-llama-cpp, chargé
+ * paresseusement — le GGUF d'embedding n'est jamais téléchargé quand
+ * `models.embed` est distant. Lot 2 : rerank et expansion distants.
  */
-export function getDefaultLlamaCpp(): LlamaCpp {
+export class HybridLLM implements QmdLLM {
+  readonly isRemote = true;
+  readonly remote: RemoteLLM;
+  private readonly localConfig: LlamaCppConfig;
+  private local: LlamaCpp | null = null;
+
+  constructor(remote: RemoteLLM, localConfig: LlamaCppConfig = {}) {
+    this.remote = remote;
+    this.localConfig = localConfig;
+  }
+
+  /** Le backend local n'existe qu'à la première opération qui l'exige. */
+  private ensureLocal(): LlamaCpp {
+    if (!this.local) {
+      this.local = new LlamaCpp({ ...this.localConfig, embedModel: undefined });
+    }
+    return this.local;
+  }
+
+  get hasLocal(): boolean {
+    return this.local !== null;
+  }
+
+  get embedModelName(): string {
+    return this.remote.embedModelName;
+  }
+
+  get generateModelName(): string {
+    return resolveGenerateModel({ generate: this.localConfig.generateModel });
+  }
+
+  get rerankModelName(): string {
+    return resolveRerankModel({ rerank: this.localConfig.rerankModel });
+  }
+
+  embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null> {
+    return this.remote.embed(text, options);
+  }
+
+  embedBatch(texts: string[], options?: EmbedOptions): Promise<(EmbeddingResult | null)[]> {
+    return this.remote.embedBatch(texts, options);
+  }
+
+  countTokens(text: string): Promise<number> {
+    return this.remote.countTokens(text);
+  }
+
+  generate(prompt: string, options?: GenerateOptions): Promise<GenerateResult | null> {
+    return this.ensureLocal().generate(prompt, options);
+  }
+
+  modelExists(model: string): Promise<ModelInfo> {
+    return looksLikeRemoteModelUri(model) ? this.remote.modelExists(model) : this.ensureLocal().modelExists(model);
+  }
+
+  expandQuery(query: string, options?: { context?: string; includeLexical?: boolean }): Promise<Queryable[]> {
+    return this.ensureLocal().expandQuery(query, options);
+  }
+
+  rerank(query: string, documents: RerankDocument[], options?: RerankOptions): Promise<RerankResult> {
+    return this.ensureLocal().rerank(query, documents, options);
+  }
+
+  async unloadIdleResources(): Promise<void> {
+    await this.local?.unloadIdleResources();
+  }
+
+  async dispose(): Promise<void> {
+    await this.remote.dispose();
+    if (this.local) {
+      await this.local.dispose();
+      this.local = null;
+    }
+  }
+}
+
+/**
+ * Fabrique du backend d'après l'URI d'embedding résolue (config > env > défaut) :
+ * `openai:` / `ollama:` ⇒ HybridLLM, sinon LlamaCpp inchangé. Une URI qui
+ * ressemble à du distant sans en respecter la forme est une erreur nommée,
+ * jamais un repli sur le GGUF par défaut (D-5).
+ */
+export function createLLM(config: LlamaCppConfig = {}): QmdLLM {
+  const embedUri = resolveEmbedModel({ embed: config.embedModel });
+  if (!looksLikeRemoteModelUri(embedUri)) {
+    return new LlamaCpp(config);
+  }
+  if (!parseRemoteModelUri(embedUri)) {
+    throw new Error(describeRemoteUriShape(embedUri));
+  }
+  return new HybridLLM(new RemoteLLM({ embedModel: embedUri }), config);
+}
+
+let defaultLlamaCpp: QmdLLM | null = null;
+
+/**
+ * Get the default LLM instance (creates one if needed). The LlamaCpp
+ * constructor installs the darwin exit guard, so any code path that obtains
+ * the singleton is protected. Fork MIXTRIO : passe par `createLLM`, donc rend
+ * un HybridLLM quand `QMD_EMBED_MODEL` est distant.
+ */
+export function getDefaultLlamaCpp(): QmdLLM {
   if (!defaultLlamaCpp) {
-    defaultLlamaCpp = new LlamaCpp();
+    defaultLlamaCpp = createLLM();
   }
   return defaultLlamaCpp;
 }
@@ -2218,7 +2356,7 @@ export function getDefaultLlamaCpp(): LlamaCpp {
  * the invariant intact for test doubles that didn't go through the real
  * constructor.
  */
-export function setDefaultLlamaCpp(llm: LlamaCpp | null): void {
+export function setDefaultLlamaCpp(llm: QmdLLM | null): void {
   if (llm !== null) installDarwinExitGuard();
   defaultLlamaCpp = llm;
 }

@@ -1264,6 +1264,27 @@ Query ──► LLM Expansion ──► [Original, Variant 1, Variant 2]
          Final Results
 ```
 
+## Remote embeddings (MIXTRIO fork)
+
+This fork can serve embeddings from an HTTP endpoint instead of a local GGUF.
+Point `models.embed` (or `QMD_EMBED_MODEL`) at a remote URI:
+
+```yaml
+models:
+  embed: "openai:https://gateway.example/v1#qwen3-embedding-8k"   # POST <base>/embeddings
+  # embed: "ollama:http://ollama.internal:11434#qwen3-embedding-8k:latest"   # POST <base>/api/embed
+```
+
+- The API key is read from `QMD_EMBED_API_KEY`, then `QMD_API_KEY` — never from the URI or
+  the YAML. `ollama:` sends no `Authorization` header.
+- The full URI is the stored model name and part of the embedding fingerprint: changing
+  the endpoint or the model marks every vector as pending; run `qmd embed` again.
+- The client is bounded (4 requests in flight, ≤ 32 inputs / ≤ 64 KB per request, 30 s
+  timeout, 3 retries with backoff, circuit breaker) and never falls back to a local model:
+  an unreachable endpoint, a rejected key or a dimension change fails `qmd embed` loudly.
+- Reranking and query expansion still run locally (next lot). `qmd doctor` probes the
+  endpoint; `qmd pull` skips remote URIs.
+
 ## Model Configuration
 
 The default models are defined in `src/llm.ts` as HuggingFace URIs:

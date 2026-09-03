@@ -6,6 +6,31 @@ Fork MIXTRIO de `tobi/qmd`, branche `mixtrio` posée sur `v2.8.3`. Chantier
 `vscode_dev_tools/analyse/SPEC-QMD-FORK-REMOTE-2026-001.md`. Convention : cette section porte
 uniquement ce que la branche ajoute par rapport au tag amont ; elle est rejouée à chaque rebase.
 
+- Version `2.8.3-mixtrio.1` — **lot 1 : embeddings distants** (`src/remote-llm.ts`).
+  - `models.embed` / `QMD_EMBED_MODEL` acceptent deux URI : `openai:<base_url>#<model>`
+    (POST `<base_url>/embeddings`, OpenAI-compatible — LiteLLM, Ollama `/v1`, vLLM, TEI) et
+    `ollama:<base_url>#<model>` (POST `<base_url>/api/embed`, `truncate: true`). L'URI
+    complète est le nom de modèle stocké dans `content_vectors.model` et entre dans le
+    fingerprint : deux endpoints ou deux modèles ne partagent jamais un espace vectoriel.
+  - Clé d'API lue dans `QMD_EMBED_API_KEY`, repli `QMD_API_KEY` ; jamais dans l'URI ni le
+    YAML ; `ollama:` n'envoie pas d'`Authorization`.
+  - Client borné : 4 requêtes en vol, ≤ 32 textes et ≤ 64 Ko par appel, timeout 30 s,
+    3 reprises à backoff (429 / 408 / 5xx / réseau / timeout, `Retry-After` honoré),
+    disjoncteur après 5 échecs consécutifs. 401/403 et autres 4xx ne sont jamais rejoués.
+  - Aucun repli silencieux : endpoint injoignable, clé refusée, réponse non JSON (SPA en
+    200), dimension qui change entre deux appels ⇒ erreur nommant l'URL et le modèle.
+    `qmd embed` échoue avant d'écrire le moindre vecteur.
+  - `createLLM()` choisit le backend d'après l'URI : `HybridLLM` (embedding distant, rerank
+    et expansion sur node-llama-cpp chargé paresseusement) ou `LlamaCpp` inchangé. Le GGUF
+    d'embedding n'est jamais téléchargé quand `models.embed` est distant.
+  - Découpage sans tokenizer : par caractères (3 par token), `chunkDocumentByTokens` prend
+    le backend en paramètre ; `qmd doctor` reproduit les vecteurs stockés (contrôle
+    d'échantillon inchangé).
+  - `qmd doctor` sonde l'endpoint distant (dimension, latence, présence de clé) à la place
+    du périphérique local ; `qmd pull` et le contrôle du cache de modèles ignorent les URI
+    distantes ; `qmd status` / `qmd embed` affichent `modèle @ base (schéma)`.
+  - Recette `test/remote-llm.test.ts` (30 tests, faux serveur HTTP en processus,
+    node-llama-cpp interdit par `setNodeLlamaCppModuleForTest`).
 - Version `2.8.3-mixtrio.0` — socle, aucun changement fonctionnel.
 
 ## [Unreleased]

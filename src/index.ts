@@ -68,6 +68,7 @@ import {
 import {
   LlamaCpp,
 } from "./llm.js";
+import { createLLM } from "./llm.js";
 import {
   setConfigSource,
   loadConfig,
@@ -381,7 +382,8 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
 
   // Create a per-store LlamaCpp instance — lazy-loads models on first use,
   // auto-unloads after 5 min inactivity to free VRAM.
-  const llm = new LlamaCpp({
+  // Fork MIXTRIO : createLLM rend un HybridLLM quand models.embed est distant.
+  const llm = createLLM({
     embedModel: config?.models?.embed,
     generateModel: config?.models?.generate,
     rerankModel: config?.models?.rerank,
