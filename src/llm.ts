@@ -2248,6 +2248,7 @@ export class HybridLLM implements QmdLLM {
   private readonly localConfig: LlamaCppConfig;
   private local: LlamaCpp | null = null;
   private rerankDisabledWarned = false;
+  private rerankFailureWarned = false;
 
   constructor(remote: RemoteLLM, localConfig: LlamaCppConfig = {}) {
     this.remote = remote;
@@ -2326,7 +2327,25 @@ export class HybridLLM implements QmdLLM {
         model: DISABLED_MODEL_URI,
       };
     }
-    if (this.remote.supportsRerank) return this.remote.rerank(query, documents, options);
+    if (this.remote.supportsRerank) {
+      try {
+        return await this.remote.rerank(query, documents, options);
+      } catch (error) {
+        // D-5 : un rerank en panne DÉGRADE, il ne casse pas la recherche. Les
+        // résultats gardent leur ordre RRF, qui reste pertinent. L'échec est
+        // journalisé bruyamment — masquer un 401 rendrait le diagnostic
+        // impossible — et une seule fois, pour ne pas noyer la sortie.
+        if (!this.rerankFailureWarned) {
+          this.rerankFailureWarned = true;
+          console.error(`⚠ Reranking distant indisponible : ${error instanceof Error ? error.message : String(error)}`);
+          console.error("  Les résultats gardent leur ordre RRF. Corriger l'endpoint ou poser `models.rerank: none` pour rendre ce mode explicite.");
+        }
+        return {
+          results: documents.map((doc, index) => ({ file: doc.file, score: 0.5, index })),
+          model: DISABLED_MODEL_URI,
+        };
+      }
+    }
     return this.ensureLocal().rerank(query, documents, options);
   }
 

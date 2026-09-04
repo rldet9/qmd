@@ -704,3 +704,56 @@ describe("HybridLLM — routage des rôles", () => {
       .toThrow(/URI de modèle distant invalide/);
   });
 });
+
+describe("HybridLLM — un rerank distant en panne dégrade (D-5)", () => {
+  let fake: Fake;
+  let warnings: string[];
+  let originalError: typeof console.error;
+
+  beforeEach(() => {
+    warnings = [];
+    originalError = console.error;
+    console.error = (...args: unknown[]) => { warnings.push(args.join(" ")); };
+  });
+
+  afterEach(async () => {
+    console.error = originalError;
+    setDefaultLlamaCpp(null);
+    await fake?.close();
+  });
+
+  test("401 sur le reranker : résultats rendus dans l'ordre RRF, jamais d'exception, et l'échec est journalisé", async () => {
+    fake = await startFake({ dims: 4, script: [] });
+    // Toutes les requêtes de rerank échouent en 401 ; l'embedding, lui, marche.
+    const rerankFake = await startFake({ script: Array.from({ length: 20 }, () => ({ status: 401 })) });
+    try {
+      const llm = createLLM({
+        embedModel: `ollama:${fake.url}#embed`,
+        rerankModel: `openai:${rerankFake.url}#rr`,
+        generateModel: "none",
+      }) as HybridLLM;
+
+      const docs = [{ file: "a", text: "ta" }, { file: "b", text: "tb" }];
+      const rr = await llm.rerank("q", docs);
+
+      // La recherche continue : ordre d'entrée préservé, scores neutres.
+      expect(rr.results.map((r) => r.file)).toEqual(["a", "b"]);
+      expect(new Set(rr.results.map((r) => r.score))).toEqual(new Set([0.5]));
+      expect(rr.model).toBe("none");
+
+      // L'échec ne passe pas sous silence : il nomme le code et la variable.
+      const joined = warnings.join("\n");
+      expect(joined).toMatch(/Reranking distant indisponible/);
+      expect(joined).toMatch(/401/);
+      expect(joined).toMatch(/QMD_RERANK_API_KEY/);
+      expect(joined).toMatch(/ordre RRF/);
+
+      // Un second appel ne re-journalise pas : un avertissement, pas un déluge.
+      warnings.length = 0;
+      await llm.rerank("q2", docs);
+      expect(warnings.join("\n")).not.toMatch(/Reranking distant indisponible/);
+    } finally {
+      await rerankFake.close();
+    }
+  });
+});

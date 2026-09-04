@@ -6,6 +6,12 @@ Fork MIXTRIO de `tobi/qmd`, branche `mixtrio` posée sur `v2.8.3`. Chantier
 `vscode_dev_tools/analyse/SPEC-QMD-FORK-REMOTE-2026-001.md`. Convention : cette section porte
 uniquement ce que la branche ajoute par rapport au tag amont ; elle est rejouée à chaque rebase.
 
+- Version `2.8.3-mixtrio.3` — **un rerank distant en panne dégrade au lieu de casser** (D-5).
+  Un 401 ou une coupure de l'endpoint de rerank faisait remonter l'exception et tuait la
+  requête entière, alors que les résultats RRF restaient parfaitement exploitables. Ils sont
+  désormais rendus avec des scores neutres, l'ordre RRF préservé, et l'échec journalisé une
+  seule fois en nommant le code HTTP et la variable de clé à poser. L'embedding, lui, garde
+  son échec dur : un vecteur manquant corrompt l'index, pas un classement.
 - Version `2.8.3-mixtrio.2` — **lot 2 : reranking et expansion distants**.
   - `models.rerank` accepte une URI `openai:<base>#<model>` → `POST <base>/rerank`,
     forme Cohere (`{model, query, documents, top_n, return_documents}` →
