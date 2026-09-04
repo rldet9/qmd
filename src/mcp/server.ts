@@ -26,6 +26,7 @@ import {
   type ExpandedQuery,
   type IndexStatus,
 } from "../index.js";
+import { documentGraphKey, getLinksIn, getLinksOut } from "../store.js";
 import { getConfigPath } from "../collections.js";
 import { enableProductionMode } from "../store.js";
 import { checkRequestOrigin, resolveOriginGuard } from "./origin-guard.js";
@@ -577,6 +578,81 @@ Intent-aware lex (C++ performance, not sports):
       return {
         content: [{ type: "text", text: summary.join('\n') }],
         structuredContent: status,
+      };
+    })
+  );
+
+  // ==========================================================================
+  // links — fork MIXTRIO (D-13) : traverser le graphe de wikilinks
+  // ==========================================================================
+  server.registerTool(
+    "links",
+    {
+      title: "Wikilink Graph",
+      description:
+        "Traverse the Obsidian wikilink graph around a document — the neighbours Obsidian shows in its local graph and backlinks panel." + "\n" + "\n" +
+        "Use this instead of `query` when the question is about CONNECTIONS rather than content: which services consume an environment variable, " +
+        "which workflows read a ContextStore key, what a note depends on." + "\n" + "\n" +
+        "`direction: 'in'` (default) answers: who references this document? — usually the more useful of the two. " +
+        "`direction: 'out'` answers: what does this document reference?" + "\n" + "\n" +
+        "Pass `path` exactly as a search result reports it (`collection/path/to/note.md`), or a docid (`#abc123`)." + "\n" + "\n" +
+        "A link that resolves to nothing is reported with `resolved: false`: the note is either missing or lives outside the indexed collections. " +
+        "That is information, not an error.",
+      annotations: { readOnlyHint: true, openWorldHint: false },
+      inputSchema: z.object({
+        path: z.string().describe("Document path or #docid, as reported by search results"),
+        direction: z.enum(["in", "out"]).optional().default("in")
+          .describe("'in' = documents referencing this one (backlinks); 'out' = documents this one references"),
+        limit: z.number().optional().default(50).describe("Max neighbours (default: 50)"),
+      }),
+    },
+    track(async ({ path, direction, limit }) => {
+      const doc = store.internal.findDocument(path, { includeBody: false });
+      if ("error" in doc) {
+        return { content: [{ type: "text" as const, text: doc.error }], isError: true };
+      }
+
+      const incoming = direction !== "out";
+      const key = documentGraphKey(doc);
+      const all = incoming
+        ? getLinksIn(store.internal.db, key.collection, key.path)
+        : getLinksOut(store.internal.db, key.collection, key.path);
+      const neighbours = all.slice(0, limit ?? 50);
+
+      const payload = {
+        document: { collection: key.collection, path: key.path, title: doc.title },
+        direction: incoming ? "in" : "out",
+        total: all.length,
+        returned: neighbours.length,
+        neighbours: neighbours.map((n) => ({
+          collection: n.collection,
+          path: n.path,
+          title: n.title,
+          target: n.target,
+          alias: n.alias,
+          anchor: n.anchor,
+          embed: n.embed,
+          resolved: n.path !== null,
+        })),
+      };
+
+      const lines = [
+        `${doc.title || key.path} (${key.collection}/${key.path})`,
+        `${all.length} ${incoming ? "incoming" : "outgoing"} link(s)`,
+        "",
+      ];
+      if (neighbours.length === 0) {
+        lines.push("None. Many documents are not Obsidian vault notes — this is not an error.");
+      }
+      for (const n of neighbours) {
+        lines.push(n.path
+          ? `- ${n.title || n.target}  [${n.collection}/${n.path}]${n.anchor ? ` #${n.anchor}` : ""}`
+          : `- ${n.alias || n.target}  (unresolved target: ${n.target})`);
+      }
+
+      return {
+        content: [{ type: "text" as const, text: lines.join("\n") }],
+        structuredContent: payload,
       };
     })
   );

@@ -9,7 +9,7 @@ import { basename, dirname, join as pathJoin, relative as relativePath, resolve 
 import { parseArgs } from "util";
 import { readFileSync, readdirSync, realpathSync, statSync, existsSync, unlinkSync, writeFileSync, openSync, closeSync, mkdirSync, lstatSync, rmSync, symlinkSync, readlinkSync, copyFileSync } from "fs";
 import { createInterface } from "readline/promises";
-import {
+import { documentGraphKey, getLinksIn, getLinksOut,
   getPwd,
   getRealPath,
   isPathInsideDir,
@@ -2159,6 +2159,55 @@ function resolveModelsForRuntime(): { embed: string; generate: string; rerank: s
   return resolveModels();
 }
 
+/**
+ * Voisins d'un document dans le graphe de wikilinks. Par defaut les liens
+ * SORTANTS (ce que le document cite) ; avec `--in`, les ENTRANTS (qui le cite),
+ * qui sont le panneau « liens entrants » d'Obsidian et souvent le plus utile :
+ * « qui consomme cette variable ? ».
+ */
+function showLinks(target: string, incoming: boolean): void {
+  const store = getStore();
+  const db = store.db;
+
+  const doc = store.findDocument(target, { includeBody: false });
+  if ("error" in doc) {
+    console.error(`${c.yellow}${doc.error}${c.reset}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  const key = documentGraphKey(doc);
+  const neighbours = incoming
+    ? getLinksIn(db, key.collection, key.path)
+    : getLinksOut(db, key.collection, key.path);
+
+  const direction = incoming ? "entrants" : "sortants";
+  console.log(`${c.bold}${doc.title || key.path}${c.reset} ${c.dim}(${key.collection}/${key.path})${c.reset}`);
+  console.log(`${c.dim}${neighbours.length} lien(s) ${direction}${c.reset}
+`);
+
+  if (neighbours.length === 0) {
+    console.log(`${c.dim}Aucun. Un document sans lien ${direction} n'est pas une erreur :${c.reset}`);
+    console.log(`${c.dim}beaucoup de documents ne sont pas des notes de coffre Obsidian.${c.reset}`);
+    return;
+  }
+
+  for (const n of neighbours) {
+    const label = n.title || n.target;
+    const mark = n.embed ? "!" : " ";
+    if (n.path) {
+      const anchor = n.anchor ? ` ${c.dim}#${n.anchor}${c.reset}` : "";
+      console.log(` ${mark} ${label}${anchor}`);
+      console.log(`     ${c.dim}${n.collection}/${n.path}${c.reset}`);
+    } else {
+      // Un lien qui ne resout vers rien est une information en soi : la note
+      // citee n'existe pas (encore), ou vit hors des collections indexees.
+      console.log(` ${mark} ${label} ${c.yellow}(non resolu)${c.reset}`);
+      console.log(`     ${c.dim}cible: ${n.target}${c.reset}`);
+    }
+  }
+}
+
 async function vectorIndex(
   model: string = resolveEmbedModelForCli(),
   force: boolean = false,
@@ -3050,7 +3099,8 @@ function parseCLI() {
       // Collection options
       name: { type: "string" },  // collection name
       mask: { type: "string" },  // glob pattern
-      glob: { type: "string" },  // alias for --mask (OpenClaw / #536)
+      glob: { type: "string" },
+      in: { type: "boolean" },  // qmd links --in : liens entrants (fork MIXTRIO)  // alias for --mask (OpenClaw / #536)
       // Embed options
       force: { type: "boolean", short: "f" },
       "max-docs-per-batch": { type: "string" },
@@ -4471,6 +4521,19 @@ if (isMain) {
 
     case "ls": {
       listFiles(cli.args[0]);
+      break;
+    }
+
+    // Fork MIXTRIO (D-13) : traverser le graphe de wikilinks, ce que la vue
+    // locale d'Obsidian fait a la souris.
+    case "links": {
+      const target = cli.args[0];
+      if (!target) {
+        console.error("Usage: qmd links <chemin|qmd://collection/chemin> [--in]");
+        process.exitCode = 1;
+        break;
+      }
+      showLinks(target, Boolean(cli.values.in));
       break;
     }
 

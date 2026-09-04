@@ -6,6 +6,30 @@ Fork MIXTRIO de `tobi/qmd`, branche `mixtrio` posée sur `v2.8.3`. Chantier
 `vscode_dev_tools/analyse/SPEC-QMD-FORK-REMOTE-2026-001.md`. Convention : cette section porte
 uniquement ce que la branche ajoute par rapport au tag amont ; elle est rejouée à chaque rebase.
 
+- Version `2.8.3-mixtrio.4` — **coffres Obsidian : frontmatter et graphe de wikilinks**
+  (`src/obsidian.ts`).
+  - **`title:` du frontmatter fait autorité** sur le premier titre markdown. QMD amont ne
+    le lit jamais ; 428 documents de nos dépôts en portent un. Le parseur ne lit que des
+    scalaires et des listes : une structure imbriquée est ignorée plutôt que de faire
+    échouer l'indexation.
+  - **Nouvelle table `links`** et nouvelle commande `qmd links <chemin> [--in]`, doublée
+    d'un **outil MCP `links`**. Ils rendent les voisins d'un document dans le graphe de
+    wikilinks : ce que la vue locale et le panneau « liens entrants » d'Obsidian montrent.
+    `--in` répond « qui cite ce document ? », le plus utile des deux.
+  - La résolution d'une cible suit Obsidian : chemin exact d'abord, nom court ensuite.
+    Un lien qui ne résout vers rien est rendu **non résolu** plutôt qu'ignoré — la note
+    est absente ou hors des collections indexées, et c'est une information.
+  - `.obsidian/` (configuration du coffre) et `.trash/` (corbeille) rejoignent les
+    exclusions codées : ni l'une ni l'autre n'est de la documentation.
+  - ⚠ **`normalizeWikilinks` n'est PAS appliqué au texte indexé**, et c'est délibéré. Les
+    positions de chunk indexent le corps ORIGINAL ; `extractSnippet` s'en sert pour
+    découper l'extrait et calculer le numéro de ligne. Transformer le texte avant de le
+    découper afficherait le mauvais extrait à la mauvaise ligne. Le coût est faible : un
+    wikilink brut contient déjà le chemin et l'alias en clair, donc BM25 les tokenise.
+  - `OBSIDIAN_PIPELINE_VERSION` entre dans l'empreinte d'embedding : le titre est
+    vectorisé avec le texte, lire le frontmatter change donc les vecteurs, et les anciens
+    doivent être considérés comme périmés plutôt que mélangés.
+  - Recette portée à 24 tests, dont un coffre réellement indexé.
 - Version `2.8.3-mixtrio.3` — **un rerank distant en panne dégrade au lieu de casser** (D-5).
   Un 401 ou une coupure de l'endpoint de rerank faisait remonter l'exception et tuait la
   requête entière, alors que les résultats RRF restaient parfaitement exploitables. Ils sont

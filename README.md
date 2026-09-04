@@ -1304,6 +1304,37 @@ models:
   with no expansion. Nothing is downloaded and nothing is called.
 - `qmd doctor` probes the embedding endpoint; `qmd pull` skips remote URIs.
 
+## Obsidian vaults (MIXTRIO fork)
+
+This fork understands two Obsidian conventions that upstream QMD ignores.
+
+**Frontmatter.** A `title:` in the YAML frontmatter takes precedence over the first
+markdown heading. Only scalars and lists are read; a nested structure is skipped rather
+than failing the index.
+
+**Wikilinks.** Every `[[target|alias]]` is recorded in a `links` table as documents are
+indexed, and the graph is queryable:
+
+```sh
+qmd links "carte/env/M3_REDIS_URL.md"        # what this note references
+qmd links "carte/env/M3_REDIS_URL.md" --in   # who references it (usually more useful)
+```
+
+The MCP tool `links` exposes the same traversal, with `direction: "in" | "out"`. Reach for
+it instead of `query` when the question is about connections rather than content — which
+services consume a variable, which workflows read a key.
+
+Target resolution follows Obsidian: exact path first, then short name. A link resolving to
+nothing is reported as unresolved rather than dropped — the note is missing or lives
+outside the indexed collections, and that is worth knowing.
+
+`.obsidian/` and `.trash/` are excluded from indexing.
+
+⚠ Wikilinks are **not** rewritten in the indexed text. Chunk positions index the original
+body, and `extractSnippet` uses them for the snippet and line number; rewriting the text
+before chunking would show the wrong excerpt at the wrong line. It costs little: a raw
+`[[a/b|c]]` already contains both `a/b` and `c` for BM25 to tokenise.
+
 ## Model Configuration
 
 The default models are defined in `src/llm.ts` as HuggingFace URIs:

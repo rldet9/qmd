@@ -13,6 +13,7 @@
 
 import { openDatabase, loadSqliteVec } from "./db.js";
 import type { QmdLLM } from "./llm.js";
+import { frontmatterTitle, extractWikilinks, shortName, targetCandidates, OBSIDIAN_PIPELINE_VERSION } from "./obsidian.js";
 import type { Database } from "./db.js";
 import picomatch from "picomatch";
 import { createHash } from "crypto";
@@ -118,6 +119,11 @@ export function getEmbeddingFingerprint(model: string = DEFAULT_EMBED_MODEL): st
     `doc:${formatDocForEmbedding(EMBED_FINGERPRINT_PROBE_DOC, EMBED_FINGERPRINT_PROBE_TITLE, model)}`,
     `chunk_tokens:${CHUNK_SIZE_TOKENS}`,
     `chunk_overlap_tokens:${CHUNK_OVERLAP_TOKENS}`,
+    // Fork MIXTRIO : le titre entre dans le texte vectorise
+    // (`formatDocForEmbedding`), et il change des que le frontmatter est lu.
+    // Sans ce composant, les anciens vecteurs resteraient consideres comme a
+    // jour alors qu'ils ont ete calcules sur un autre titre.
+    `obsidian_pipeline:${OBSIDIAN_PIPELINE_VERSION}`,
   ].join("\n");
   return createHash("sha256").update(significant).digest("hex").slice(0, 6);
 }
@@ -1267,6 +1273,20 @@ function initializeDatabase(db: Database): void {
 
   // Store config — key-value metadata (e.g. config_hash for sync optimization)
   db.exec(`
+    CREATE TABLE IF NOT EXISTS links (
+      source_collection TEXT NOT NULL,
+      source_path TEXT NOT NULL,
+      target TEXT NOT NULL,
+      alias TEXT,
+      anchor TEXT,
+      embed INTEGER NOT NULL DEFAULT 0,
+      UNIQUE(source_collection, source_path, target, alias, anchor)
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_links_source ON links(source_collection, source_path)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_links_target ON links(target)`);
+
+  db.exec(`
     CREATE TABLE IF NOT EXISTS store_config (
       key TEXT PRIMARY KEY,
       value TEXT
@@ -1614,7 +1634,9 @@ export async function reindexCollection(
 ): Promise<ReindexResult> {
   const db = store.db;
   const now = new Date().toISOString();
-  const excludeDirs = ["node_modules", ".git", ".cache", "vendor", "dist", "build"];
+  // `.obsidian` est la configuration du coffre et `.trash` sa corbeille : ni
+  // l'une ni l'autre n'est de la documentation (fork MIXTRIO, D-12).
+  const excludeDirs = ["node_modules", ".git", ".cache", "vendor", "dist", "build", ".obsidian", ".trash"];
 
   const allIgnore = [
     ...excludeDirs.map(d => `**/${d}/**`),
@@ -1704,6 +1726,11 @@ export async function reindexCollection(
         stat ? new Date(stat.birthtime).toISOString() : now,
         stat ? new Date(stat.mtime).toISOString() : now);
     }
+
+    // Fork MIXTRIO (D-13) : le graphe de wikilinks, reconstruit a chaque passe.
+    // Les liens sont une propriete du CONTENU, pas de l'embedding : ils sont
+    // donc a jour des `qmd update`, sans attendre `qmd embed`.
+    replaceDocumentLinks(db, collectionName, path, extractWikilinks(content));
 
     processed++;
     options?.onProgress?.({ file: relativeFile, current: processed, total });
@@ -2855,6 +2882,143 @@ export function runCleanup(db: Database): CleanupStats {
 }
 
 // =============================================================================
+// Graphe de wikilinks (fork MIXTRIO, D-13)
+// =============================================================================
+
+export type GraphNeighbour = {
+  /** Chemin du document voisin, `null` quand le lien ne resout vers rien. */
+  path: string | null;
+  collection: string;
+  title: string | null;
+  /** La cible telle qu'ecrite dans le wikilink. */
+  target: string;
+  alias: string | null;
+  anchor: string | null;
+  embed: boolean;
+};
+
+/**
+ * Cle d'un document dans la table `links`, depuis un `DocumentResult`.
+ *
+ * ⚠ `DocumentResult.displayPath` porte le prefixe de collection
+ * (`ma-collection/dossier/note.md`) alors que `documents.path` ne le porte PAS
+ * (`dossier/note.md`). Interroger le graphe avec `displayPath` tel quel rend
+ * zero lien sortant, en silence. Constate le 2026-09-04 sur la carto.
+ */
+export function documentGraphKey(doc: { collectionName: string; displayPath: string }): { collection: string; path: string } {
+  const prefix = `${doc.collectionName}/`;
+  return {
+    collection: doc.collectionName,
+    path: doc.displayPath.startsWith(prefix) ? doc.displayPath.slice(prefix.length) : doc.displayPath,
+  };
+}
+
+/** Remplace tous les liens sortants d'un document. */
+export function replaceDocumentLinks(
+  db: Database,
+  collection: string,
+  path: string,
+  links: { target: string; alias: string | null; anchor: string | null; embed: boolean }[],
+): void {
+  db.prepare(`DELETE FROM links WHERE source_collection = ? AND source_path = ?`).run(collection, path);
+  if (links.length === 0) return;
+  const insert = db.prepare(
+    `INSERT OR IGNORE INTO links (source_collection, source_path, target, alias, anchor, embed)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+  );
+  for (const link of links) {
+    insert.run(collection, path, link.target, link.alias, link.anchor, link.embed ? 1 : 0);
+  }
+}
+
+/**
+ * Resout une cible de wikilink vers un document indexe. Obsidian accepte le
+ * chemin complet comme le nom court ; on essaie donc, dans l'ordre, le chemin
+ * exact puis le nom court en suffixe. Une cible ambigue (plusieurs documents de
+ * meme nom court) rend le premier par ordre alphabetique — l'ambiguite est
+ * signalee par le champ `path` non nul mais le lien reste tracable par `target`.
+ */
+function resolveLinkTarget(db: Database, target: string): { path: string; collection: string; title: string | null } | null {
+  const { exact, suffix } = targetCandidates(target);
+  for (const candidate of exact) {
+    const row = db.prepare(
+      `SELECT path, collection, title FROM documents WHERE active = 1 AND path = ? ORDER BY collection LIMIT 1`,
+    ).get(candidate) as { path: string; collection: string; title: string | null } | undefined;
+    if (row) return row;
+  }
+  // Repli par nom court. Le LIKE dégrossit, mais `%` et `_` y sont des
+  // jokers : un nom de fichier qui en contient produirait de faux positifs.
+  // Plutôt qu'un ESCAPE fragile, on confirme le suffixe en JavaScript, où la
+  // comparaison est littérale.
+  const rows = db.prepare(
+    `SELECT path, collection, title FROM documents WHERE active = 1 AND path LIKE ? ORDER BY path`,
+  ).all(`%${suffix}`) as { path: string; collection: string; title: string | null }[];
+  return rows.find((row) => row.path.endsWith(suffix)) ?? null;
+}
+
+/** Les documents que `path` cite (liens sortants). */
+export function getLinksOut(db: Database, collection: string, path: string): GraphNeighbour[] {
+  const rows = db.prepare(
+    `SELECT target, alias, anchor, embed FROM links
+     WHERE source_collection = ? AND source_path = ? ORDER BY target`,
+  ).all(collection, path) as { target: string; alias: string | null; anchor: string | null; embed: number }[];
+
+  return rows.map((row) => {
+    const resolved = resolveLinkTarget(db, row.target);
+    return {
+      path: resolved?.path ?? null,
+      collection: resolved?.collection ?? collection,
+      title: resolved?.title ?? null,
+      target: row.target,
+      alias: row.alias,
+      anchor: row.anchor,
+      embed: row.embed === 1,
+    };
+  });
+}
+
+/** Les documents qui citent `path` (liens entrants). */
+export function getLinksIn(db: Database, collection: string, path: string): GraphNeighbour[] {
+  // Un lien entrant peut viser le chemin complet ou le seul nom court : on
+  // interroge les deux formes, puis on ecarte les auto-references.
+  const withoutMd = path.replace(/\.md$/i, "");
+  const short = shortName(withoutMd);
+  const rows = db.prepare(
+    `SELECT l.source_collection, l.source_path, l.target, l.alias, l.anchor, l.embed, d.title
+     FROM links l
+     LEFT JOIN documents d ON d.collection = l.source_collection AND d.path = l.source_path AND d.active = 1
+     WHERE l.target = ? OR l.target = ? OR l.target = ? OR l.target LIKE ?
+     ORDER BY l.source_collection, l.source_path`,
+  ).all(withoutMd, path, short, `%/${short}`) as {
+    source_collection: string; source_path: string; target: string;
+    alias: string | null; anchor: string | null; embed: number; title: string | null;
+  }[];
+
+  return rows
+    .filter((row) => !(row.source_collection === collection && row.source_path === path))
+    .map((row) => ({
+      path: row.source_path,
+      collection: row.source_collection,
+      title: row.title,
+      target: row.target,
+      alias: row.alias,
+      anchor: row.anchor,
+      embed: row.embed === 1,
+    }));
+}
+
+/** Compte des liens, pour `status` et les diagnostics. */
+export function getLinkStats(db: Database): { total: number; documents: number; unresolved: number } {
+  const total = (db.prepare(`SELECT COUNT(*) n FROM links`).get() as { n: number }).n;
+  const documents = (db.prepare(`SELECT COUNT(DISTINCT source_path) n FROM links`).get() as { n: number }).n;
+  let unresolved = 0;
+  for (const row of db.prepare(`SELECT DISTINCT target FROM links`).all() as { target: string }[]) {
+    if (!resolveLinkTarget(db, row.target)) unresolved++;
+  }
+  return { total, documents, unresolved };
+}
+
+// =============================================================================
 // Document helpers
 // =============================================================================
 
@@ -2887,6 +3051,12 @@ const titleExtractors: Record<string, (content: string) => string | null> = {
 };
 
 export function extractTitle(content: string, filename: string): string {
+  // Fork MIXTRIO (D-12) : dans un coffre Obsidian, `title:` du frontmatter fait
+  // autorite sur le premier titre markdown. 428 documents de m3-orionai-core en
+  // portent un ; QMD amont ne le lit jamais.
+  const fmTitle = frontmatterTitle(content);
+  if (fmTitle) return fmTitle;
+
   const ext = filename.slice(filename.lastIndexOf('.')).toLowerCase();
   const extractor = titleExtractors[ext];
   if (extractor) {
