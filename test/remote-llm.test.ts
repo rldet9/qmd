@@ -16,11 +16,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   RemoteEmbeddingClient,
+  RemoteRerankClient,
+  RemoteChatClient,
   RemoteLLM,
   RemoteLLMError,
   parseRemoteModelUri,
   isRemoteModelUri,
   looksLikeRemoteModelUri,
+  isDisabledModelUri,
+  parseExpansionLines,
+  defaultQueryables,
   resolveRemoteApiKey,
   REMOTE_DEFAULTS,
 } from "../src/remote-llm.js";
@@ -40,6 +45,14 @@ type Recorded = {
 
 type FakeOptions = {
   dims?: number;
+  /** Scores rendus par /rerank, dans l'ordre des documents reçus. */
+  rerankScores?: number[];
+  /** Contenu rendu par /chat/completions. */
+  chatContent?: string;
+  /** Refuse tout lot de rerank de plus de N documents (simule un 413). */
+  rerankMaxDocs?: number;
+  /** Refuse tout document de plus de N caractères (simule un 413). */
+  rerankMaxDocChars?: number;
   /** Séquence de réponses forcées, consommée requête par requête (status, body?). */
   script?: Array<{ status: number; body?: string; headers?: Record<string, string> }>;
   delayMs?: number;
@@ -75,6 +88,40 @@ async function startFake(options: FakeOptions = {}): Promise<Fake> {
       if (forced) {
         res.writeHead(forced.status, { "content-type": "application/json", ...(forced.headers ?? {}) });
         res.end(forced.body ?? JSON.stringify({ error: { message: `forced ${forced.status}` } }));
+        inFlight--;
+        return;
+      }
+
+      const url = req.url ?? "";
+
+      if (url.endsWith("/rerank")) {
+        const docs: string[] = body?.documents ?? [];
+        const tooMany = options.rerankMaxDocs !== undefined && docs.length > options.rerankMaxDocs;
+        const tooLong = options.rerankMaxDocChars !== undefined && docs.some((d) => d.length > options.rerankMaxDocChars!);
+        if (tooMany || tooLong) {
+          res.writeHead(413, { "content-type": "application/json" });
+          res.end(JSON.stringify({ detail: "payload too large to process" }));
+          inFlight--;
+          return;
+        }
+        const scores = options.rerankScores ?? docs.map((_, i) => 1 / (i + 1));
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+          object: "rerank",
+          model: body.model,
+          // Volontairement dans le désordre, pour vérifier le remappage par index.
+          results: docs.map((_, i) => ({ index: i, relevance_score: scores[i] ?? 0 })).reverse(),
+          usage: { prompt_tokens: 1, total_tokens: 1 },
+        }));
+        inFlight--;
+        return;
+      }
+
+      if (url.endsWith("/chat/completions")) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+          choices: [{ message: { role: "assistant", content: options.chatContent ?? "" } }],
+        }));
         inFlight--;
         return;
       }
@@ -461,5 +508,199 @@ describe("createStore avec models.embed distant", () => {
     const vec = store.internal.db.prepare(`SELECT 1 FROM sqlite_master WHERE name = 'vectors_vec'`).get();
     expect(vec).toBeUndefined();
     await store.close();
+  });
+});
+
+// =============================================================================
+// Lot 2 — reranking distant (D-7)
+// =============================================================================
+
+describe("RemoteRerankClient", () => {
+  let fake: Fake;
+  afterEach(async () => { await fake?.close(); });
+
+  const client = (f: Fake, opts = {}) =>
+    new RemoteRerankClient(parseRemoteModelUri(`openai:${f.url}#BAAI/bge-reranker-v2-m3`)!, { sleep: noSleep, warn: quiet, ...opts });
+
+  test("POST /rerank en forme Cohere, scores rendus TELS QUELS et remappés sur les documents d'origine", async () => {
+    fake = await startFake({ rerankScores: [0.619, 0.0000167, 0.42] });
+    const hits = await client(fake).rerank("clés virtuelles", ["pertinent", "hors sujet", "moyen"]);
+
+    expect(fake.requests[0]!.path).toBe("/rerank");
+    expect(fake.requests[0]!.body).toMatchObject({
+      model: "BAAI/bge-reranker-v2-m3",
+      query: "clés virtuelles",
+      documents: ["pertinent", "hors sujet", "moyen"],
+      top_n: 3,
+      return_documents: false,
+    });
+    // Les valeurs mesurées sur Infinity ne sont ni normalisées ni écrêtées.
+    expect(hits.find((h) => h.index === 0)!.score).toBe(0.619);
+    expect(hits.find((h) => h.index === 1)!.score).toBe(0.0000167);
+    expect(hits.find((h) => h.index === 2)!.score).toBe(0.42);
+  });
+
+  test("un score hors de [0,1] est une erreur nommant le modèle, jamais une sigmoïde (D-7)", async () => {
+    // Un seul document : le message nomme forcément ce score-là, quel que soit
+    // l'ordre dans lequel le serveur rend ses résultats.
+    fake = await startFake({ rerankScores: [7.3] });
+    const error = await client(fake).rerank("q", ["a"]).catch((e) => e);
+    expect(error).toBeInstanceOf(RemoteLLMError);
+    expect(error.kind).toBe("score");
+    expect(error.message).toMatch(/7\.3/);
+    expect(error.message).toMatch(/bge-reranker-v2-m3/);
+    expect(error.message).toMatch(/D-7/);
+  });
+
+  test("413 sur un gros lot : bissection, et tous les documents gardent leur index", async () => {
+    fake = await startFake({ rerankMaxDocs: 2 });
+    const docs = ["d0", "d1", "d2", "d3", "d4", "d5", "d6"];
+    const hits = await client(fake).rerank("q", docs);
+    expect(hits).toHaveLength(7);
+    expect([...hits.map((h) => h.index)].sort((a, b) => a - b)).toEqual([0, 1, 2, 3, 4, 5, 6]);
+    expect(fake.requests.filter((r) => r.path === "/rerank").length).toBeGreaterThan(1);
+  });
+
+  test("413 sur un document unique trop long : troncature de moitié jusqu'à passer", async () => {
+    fake = await startFake({ rerankMaxDocChars: 50 });
+    const hits = await client(fake).rerank("q", ["x".repeat(400)]);
+    expect(hits).toHaveLength(1);
+    expect(hits[0]!.index).toBe(0);
+    const last = fake.requests.filter((r) => r.path === "/rerank").at(-1)!;
+    expect(last.body.documents[0].length).toBeLessThanOrEqual(50);
+  });
+
+  test("un nombre de scores différent du nombre de documents est une erreur de contrat", async () => {
+    fake = await startFake({ script: [{ status: 200, body: JSON.stringify({ results: [{ index: 0, relevance_score: 0.5 }] }) }] });
+    await expect(client(fake).rerank("q", ["a", "b", "c"])).rejects.toMatchObject({ kind: "contract" });
+  });
+
+  test("401 : erreur d'authentification, une seule requête", async () => {
+    fake = await startFake({ script: [{ status: 401 }] });
+    const error = await client(fake, { apiKey: "bad" }).rerank("q", ["a"]).catch((e) => e);
+    expect(error.kind).toBe("auth");
+    expect(fake.requests).toHaveLength(1);
+  });
+});
+
+// =============================================================================
+// Lot 2 — expansion de requête distante
+// =============================================================================
+
+describe("parseExpansionLines", () => {
+  test("garde les trois types, ôte les guillemets, respecte includeLexical", () => {
+    const raw = 'lex: "clés virtuelles LiteLLM"\nvec: comment sont provisionnées les clés virtuelles LiteLLM ?\nhyde: Les clés virtuelles LiteLLM sont créées par un script idempotent.';
+    const all = parseExpansionLines(raw, "clés virtuelles LiteLLM");
+    expect(all.map((q) => q.type)).toEqual(["lex", "vec", "hyde"]);
+    expect(all[0]!.text).toBe("clés virtuelles LiteLLM");
+    expect(parseExpansionLines(raw, "clés virtuelles LiteLLM", false).map((q) => q.type)).toEqual(["vec", "hyde"]);
+  });
+
+  test("le garde-fou rejette un modèle qui traduit ou hallucine, et retombe sur la requête", () => {
+    // Sortie réelle de hermes3-8k mesurée le 2026-09-04 : traduit en anglais et
+    // écrit « Littell » au lieu de « LiteLLM ». Aucun terme commun, tout est jeté.
+    const raw = "lex: virtual machines Littell provisioning\nvec: What are the provisions for Littell?\nhyde: The Littell system offers flexible provisioning.";
+    const out = parseExpansionLines(raw, "cles virtuelles LiteLLM provisionnement");
+    expect(out).toEqual(defaultQueryables("cles virtuelles LiteLLM provisionnement"));
+  });
+
+  test("une sortie sans ligne exploitable retombe sur lex + vec", () => {
+    expect(parseExpansionLines("je ne sais pas repondre", "sujet")).toEqual(defaultQueryables("sujet"));
+    expect(parseExpansionLines("", "sujet")).toEqual(defaultQueryables("sujet"));
+  });
+});
+
+describe("RemoteChatClient.expandQuery", () => {
+  let fake: Fake;
+  afterEach(async () => { await fake?.close(); });
+
+  test("envoie system + user et parse les lignes rendues", async () => {
+    fake = await startFake({ chatContent: "lex: registre nodes\nvec: comment le registre des nodes est-il construit ?\nhyde: Le registre des nodes vient des classes compilees." });
+    const c = new RemoteChatClient(parseRemoteModelUri(`openai:${fake.url}#hermes3`)!, { sleep: noSleep, warn: quiet });
+    const out = await c.expandQuery("registre nodes");
+    expect(out.map((q) => q.type)).toEqual(["lex", "vec", "hyde"]);
+    expect(fake.requests[0]!.path).toBe("/chat/completions");
+    expect(fake.requests[0]!.body.messages[0].role).toBe("system");
+    expect(fake.requests[0]!.body.messages[1].content).toBe("registre nodes");
+  });
+
+  test("un endpoint en panne ne casse pas la recherche : repli sur la requête telle quelle", async () => {
+    fake = await startFake({ script: Array.from({ length: 9 }, () => ({ status: 500 })) });
+    const c = new RemoteChatClient(parseRemoteModelUri(`openai:${fake.url}#hermes3`)!, { sleep: noSleep, warn: quiet, maxRetries: 1 });
+    await expect(c.expandQuery("sujet")).resolves.toEqual(defaultQueryables("sujet"));
+  });
+});
+
+// =============================================================================
+// Lot 2 — routage HybridLLM et rôles désactivés
+// =============================================================================
+
+describe("HybridLLM — routage des rôles", () => {
+  let fake: Fake;
+  afterEach(async () => {
+    setNodeLlamaCppModuleForTest(null);
+    setDefaultLlamaCpp(null);
+    await fake?.close();
+  });
+
+  const forbidLocal = () => {
+    const boom = new Error("node-llama-cpp ne doit pas etre charge quand tous les roles sont distants ou desactives");
+    setNodeLlamaCppModuleForTest({
+      getLlama: async () => { throw boom; },
+      resolveModelFile: async () => { throw boom; },
+      LlamaChatSession: class { constructor() { throw boom; } prompt = async () => ""; } as any,
+      LlamaLogLevel: { error: 0 },
+    });
+  };
+
+  test("les trois rôles distants : rerank et expansion partent en HTTP, aucun modèle local", async () => {
+    fake = await startFake({ dims: 4, rerankScores: [0.9, 0.1], chatContent: "lex: sujet\nvec: sujet en question" });
+    forbidLocal();
+    const llm = createLLM({
+      embedModel: `ollama:${fake.url}#embed`,
+      rerankModel: `openai:${fake.url}#rerank`,
+      generateModel: `openai:${fake.url}#chat`,
+    }) as HybridLLM;
+
+    expect(llm.rerankModelName).toBe(`openai:${fake.url}#rerank`);
+    expect(llm.generateModelName).toBe(`openai:${fake.url}#chat`);
+
+    const rr = await llm.rerank("sujet", [{ file: "a", text: "ta" }, { file: "b", text: "tb" }]);
+    expect(rr.results[0]).toMatchObject({ file: "a", score: 0.9 });
+    expect(rr.results[1]).toMatchObject({ file: "b", score: 0.1 });
+
+    const ex = await llm.expandQuery("sujet");
+    expect(ex.map((q) => q.type)).toEqual(["lex", "vec"]);
+    expect(llm.hasLocal).toBe(false);
+  });
+
+  test("rôles désactivés par `none` : scores neutres, ordre préservé, aucun GGUF chargé", async () => {
+    fake = await startFake({ dims: 4 });
+    forbidLocal();
+    const llm = createLLM({
+      embedModel: `ollama:${fake.url}#embed`,
+      rerankModel: "none",
+      generateModel: "none",
+    }) as HybridLLM;
+
+    expect(llm.rerankModelName).toBe("none");
+    expect(llm.generateModelName).toBe("none");
+    expect(isDisabledModelUri("none")).toBe(true);
+
+    const docs = [{ file: "a", text: "ta" }, { file: "b", text: "tb" }, { file: "c", text: "tc" }];
+    const rr = await llm.rerank("q", docs);
+    expect(rr.model).toBe("none");
+    expect(rr.results.map((r) => r.file)).toEqual(["a", "b", "c"]);
+    expect(new Set(rr.results.map((r) => r.score))).toEqual(new Set([0.5]));
+
+    await expect(llm.expandQuery("sujet")).resolves.toEqual(defaultQueryables("sujet"));
+    expect(llm.hasLocal).toBe(false);
+    // Aucune requête HTTP non plus : un rôle désactivé n'appelle personne.
+    expect(fake.requests.filter((r) => r.path.includes("rerank") || r.path.includes("chat")).length).toBe(0);
+  });
+
+  test("une URI de rerank distante mal formée est refusée à la construction", () => {
+    expect(() => createLLM({ embedModel: "ollama:http://h:1#e", rerankModel: "openai:pas-une-url" }))
+      .toThrow(/URI de modèle distant invalide/);
   });
 });

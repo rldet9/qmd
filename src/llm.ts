@@ -10,7 +10,7 @@ import type {
   LlamaEmbeddingContext,
   Token as LlamaToken,
 } from "node-llama-cpp";
-import { RemoteLLM, looksLikeRemoteModelUri, parseRemoteModelUri, describeRemoteUriShape } from "./remote-llm.js";
+import { RemoteLLM, looksLikeRemoteModelUri, parseRemoteModelUri, describeRemoteUriShape, isDisabledModelUri, defaultQueryables, DISABLED_MODEL_URI } from "./remote-llm.js";
 
 type StdoutChunk = string | Uint8Array;
 type WriteCallback = (err?: Error | null) => void;
@@ -2247,6 +2247,7 @@ export class HybridLLM implements QmdLLM {
   readonly remote: RemoteLLM;
   private readonly localConfig: LlamaCppConfig;
   private local: LlamaCpp | null = null;
+  private rerankDisabledWarned = false;
 
   constructor(remote: RemoteLLM, localConfig: LlamaCppConfig = {}) {
     this.remote = remote;
@@ -2270,10 +2271,14 @@ export class HybridLLM implements QmdLLM {
   }
 
   get generateModelName(): string {
+    if (this.remote.supportsExpand) return this.remote.generateModelName;
+    if (isDisabledModelUri(this.localConfig.generateModel)) return DISABLED_MODEL_URI;
     return resolveGenerateModel({ generate: this.localConfig.generateModel });
   }
 
   get rerankModelName(): string {
+    if (this.remote.supportsRerank) return this.remote.rerankModelName;
+    if (isDisabledModelUri(this.localConfig.rerankModel)) return DISABLED_MODEL_URI;
     return resolveRerankModel({ rerank: this.localConfig.rerankModel });
   }
 
@@ -2297,11 +2302,31 @@ export class HybridLLM implements QmdLLM {
     return looksLikeRemoteModelUri(model) ? this.remote.modelExists(model) : this.ensureLocal().modelExists(model);
   }
 
-  expandQuery(query: string, options?: { context?: string; includeLexical?: boolean }): Promise<Queryable[]> {
+  async expandQuery(query: string, options?: { context?: string; includeLexical?: boolean }): Promise<Queryable[]> {
+    const includeLexical = options?.includeLexical !== false;
+    // Rôle désactivé (`models.generate: none`) : la requête telle quelle, et
+    // surtout AUCUN GGUF de génération téléchargé.
+    if (isDisabledModelUri(this.localConfig.generateModel)) {
+      return defaultQueryables(query, includeLexical);
+    }
+    if (this.remote.supportsExpand) return this.remote.expandQuery(query, options);
     return this.ensureLocal().expandQuery(query, options);
   }
 
-  rerank(query: string, documents: RerankDocument[], options?: RerankOptions): Promise<RerankResult> {
+  async rerank(query: string, documents: RerankDocument[], options?: RerankOptions): Promise<RerankResult> {
+    // Rôle désactivé : scores neutres, ordre d'entrée préservé (le tri de store.ts
+    // est stable), donc le classement RRF amont fait foi. Aucun GGUF chargé.
+    if (isDisabledModelUri(this.localConfig.rerankModel)) {
+      if (!this.rerankDisabledWarned) {
+        this.rerankDisabledWarned = true;
+        console.error("⚠ Reranking désactivé (models.rerank: none) — les résultats gardent leur ordre RRF");
+      }
+      return {
+        results: documents.map((doc, index) => ({ file: doc.file, score: 0.5, index })),
+        model: DISABLED_MODEL_URI,
+      };
+    }
+    if (this.remote.supportsRerank) return this.remote.rerank(query, documents, options);
     return this.ensureLocal().rerank(query, documents, options);
   }
 
@@ -2326,13 +2351,28 @@ export class HybridLLM implements QmdLLM {
  */
 export function createLLM(config: LlamaCppConfig = {}): QmdLLM {
   const embedUri = resolveEmbedModel({ embed: config.embedModel });
+  const rerankUri = config.rerankModel ?? process.env.QMD_RERANK_MODEL;
+  const generateUri = config.generateModel ?? process.env.QMD_GENERATE_MODEL;
+
+  // Une URI qui se donne pour distante sans en respecter la forme est une erreur
+  // nommée sur CHAQUE rôle, jamais un repli silencieux sur le GGUF par défaut (D-5).
+  for (const uri of [embedUri, rerankUri, generateUri]) {
+    if (looksLikeRemoteModelUri(uri) && !parseRemoteModelUri(uri)) {
+      throw new Error(describeRemoteUriShape(uri!));
+    }
+  }
+
+  // L'embedding décide du backend : sans embedding distant, rien ne change.
   if (!looksLikeRemoteModelUri(embedUri)) {
     return new LlamaCpp(config);
   }
-  if (!parseRemoteModelUri(embedUri)) {
-    throw new Error(describeRemoteUriShape(embedUri));
-  }
-  return new HybridLLM(new RemoteLLM({ embedModel: embedUri }), config);
+
+  const remote = new RemoteLLM({
+    embedModel: embedUri,
+    rerankModel: looksLikeRemoteModelUri(rerankUri) ? rerankUri : undefined,
+    generateModel: looksLikeRemoteModelUri(generateUri) ? generateUri : undefined,
+  });
+  return new HybridLLM(remote, { ...config, rerankModel: rerankUri, generateModel: generateUri });
 }
 
 let defaultLlamaCpp: QmdLLM | null = null;

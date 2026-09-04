@@ -1282,8 +1282,27 @@ models:
 - The client is bounded (4 requests in flight, ≤ 32 inputs / ≤ 64 KB per request, 30 s
   timeout, 3 retries with backoff, circuit breaker) and never falls back to a local model:
   an unreachable endpoint, a rejected key or a dimension change fails `qmd embed` loudly.
-- Reranking and query expansion still run locally (next lot). `qmd doctor` probes the
-  endpoint; `qmd pull` skips remote URIs.
+Reranking and query expansion can be remote too:
+
+```yaml
+models:
+  rerank: "openai:http://reranker.internal:7997#BAAI/bge-reranker-v2-m3"  # POST <base>/rerank
+  generate: "openai:https://gateway.example/v1#some-chat-model"           # POST <base>/chat/completions
+  # or disable a role entirely — no local model is ever loaded:
+  # rerank: none
+  # generate: none
+```
+
+- **Rerank scores are never transformed.** The server must return values in `[0, 1]`;
+  anything else is an error naming the model, not a signal to squash through a sigmoid.
+  A cross-encoder emitting log-odds should stay local or be fronted by a gateway that
+  normalises properly.
+- Oversized rerank batches (HTTP 413 or a context-length message) are bisected, then a
+  lone oversized document is halved down to a 32-character floor, preserving indices.
+- A failing expansion endpoint never breaks search: the query is used as-is.
+- `none` disables a role: neutral rerank scores preserving RRF order, or `lex + vec`
+  with no expansion. Nothing is downloaded and nothing is called.
+- `qmd doctor` probes the embedding endpoint; `qmd pull` skips remote URIs.
 
 ## Model Configuration
 

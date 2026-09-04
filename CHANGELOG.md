@@ -6,6 +6,34 @@ Fork MIXTRIO de `tobi/qmd`, branche `mixtrio` posée sur `v2.8.3`. Chantier
 `vscode_dev_tools/analyse/SPEC-QMD-FORK-REMOTE-2026-001.md`. Convention : cette section porte
 uniquement ce que la branche ajoute par rapport au tag amont ; elle est rejouée à chaque rebase.
 
+- Version `2.8.3-mixtrio.2` — **lot 2 : reranking et expansion distants**.
+  - `models.rerank` accepte une URI `openai:<base>#<model>` → `POST <base>/rerank`,
+    forme Cohere (`{model, query, documents, top_n, return_documents}` →
+    `results[].{index, relevance_score}`). Les index sont remappés sur les documents
+    d'origine, quel que soit l'ordre rendu par le serveur.
+  - **Les scores ne sont pas transformés.** Un score hors de `[0, 1]` est une erreur
+    nommant le modèle, jamais une normalisation silencieuse. Mesuré sur Infinity
+    (`BAAI/bge-reranker-v2-m3`) : 0,619 pour le document pertinent contre 0,0000167
+    pour les autres — la sigmoïde de la PR amont #705 les écraserait à 0,65 contre
+    0,5 et détruirait cette discrimination.
+  - Récupération sur refus « trop gros » (413 ou message de contexte dépassé) :
+    bissection du lot, puis troncature de moitié d'un document isolé jusqu'à un
+    plancher de 32 caractères, en préservant les index d'origine.
+  - `models.generate` accepte une URI `openai:<base>#<model>` → expansion de requête
+    par `POST <base>/chat/completions`. Le parseur `lex:`/`vec:`/`hyde:` est extrait
+    en `parseExpansionLines()` et partagé avec le backend local ; son garde-fou
+    rejette toute ligne ne partageant aucun terme avec la requête, ce qui protège
+    d'un modèle qui traduit ou hallucine. Une panne d'expansion ne casse jamais la
+    recherche : repli sur la requête telle quelle.
+  - **Nouveau : `none` désactive un rôle.** `models.rerank: none` rend des scores
+    neutres en préservant l'ordre RRF ; `models.generate: none` rend `lex + vec`.
+    Dans les deux cas, aucun modèle local n'est chargé et aucun appel distant n'est
+    fait — c'est ce qui permet de tourner sans un octet de GGUF.
+  - La mécanique HTTP (timeout, reprises, disjoncteur, concurrence bornée) est
+    factorisée dans `RemoteHttpTransport`, partagée par les trois clients. Chaque
+    client porte son rôle, pour que le message d'un 401 nomme la variable exacte à
+    poser (`QMD_RERANK_API_KEY`, etc.).
+  - Recette portée à 44 tests.
 - Version `2.8.3-mixtrio.1` — **lot 1 : embeddings distants** (`src/remote-llm.ts`).
   - `models.embed` / `QMD_EMBED_MODEL` acceptent deux URI : `openai:<base_url>#<model>`
     (POST `<base_url>/embeddings`, OpenAI-compatible — LiteLLM, Ollama `/v1`, vLLM, TEI) et
